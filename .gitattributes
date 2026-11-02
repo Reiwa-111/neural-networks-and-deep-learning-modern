@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+# Binary datasets, checkpoints, plots and archives
+*.gz binary
+*.npz binary
+*.pt binary
+*.pth binary
+*.png binary

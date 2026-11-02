@@ -1,8 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.coverage
+htmlcov/
+
+# Training artifacts
+/runs/
+/data/*.npz
+/data/emnist/
+*.pt
+*.pth
+*.onnx
+/fig/test.png
+
+# Logs and generated caches
+*.log
+.cache/
+
+# OS/editor
+.DS_Store
+Thumbs.db
 *~
 *.org
 *.pem
-*.pkl
-*.pyc
-.DS_Store
+.idea/
+.vscode/
+
+# Local overrides
 loc.py
 src/ec2

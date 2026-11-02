@@ -1,64 +1,52 @@
-"""
-mnist_average_darkness
-~~~~~~~~~~~~~~~~~~~~~~
+"""Naive average-darkness baseline (modernized)."""
 
-A naive classifier for recognizing handwritten digits from the MNIST
-data set.  The program classifies digits based on how dark they are
---- the idea is that digits like "1" tend to be less dark than digits
-like "8", simply because the latter has a more complex shape.  When
-shown an image the classifier returns whichever digit in the training
-data had the closest average darkness.
+from __future__ import annotations
 
-The program works in two steps: first it trains the classifier, and
-then it applies the classifier to the MNIST test data to see how many
-digits are correctly classified.
-
-Needless to say, this isn't a very good way of recognizing handwritten
-digits!  Still, it's useful to show what sort of performance we get
-from naive ideas."""
-
-#### Libraries
-# Standard library
+import argparse
+import json
 from collections import defaultdict
+from pathlib import Path
 
-# My libraries
-import mnist_loader
+import numpy as np
 
-def main():
-    training_data, validation_data, test_data = mnist_loader.load_data()
-    # training phase: compute the average darknesses for each digit,
-    # based on the training data
-    avgs = avg_darknesses(training_data)
-    # testing phase: see how many of the test images are classified
-    # correctly
-    num_correct = sum(int(guess_digit(image, avgs) == digit)
-                      for image, digit in zip(test_data[0], test_data[1]))
-    print "Baseline classifier using average darkness of image."
-    print "%s of %s values correct." % (num_correct, len(test_data[1]))
+from nndl.baselines import average_darkness
 
-def avg_darknesses(training_data):
-    """ Return a defaultdict whose keys are the digits 0 through 9.
-    For each digit we compute a value which is the average darkness of
-    training images containing that digit.  The darkness for any
-    particular image is just the sum of the darknesses for each pixel."""
-    digit_counts = defaultdict(int)
-    darknesses = defaultdict(float)
+
+def avg_darknesses(training_data) -> defaultdict:
+    """Average pixel sum for every digit in the training data."""
+
+    digit_counts: defaultdict = defaultdict(int)
+    darknesses: defaultdict = defaultdict(float)
     for image, digit in zip(training_data[0], training_data[1]):
-        digit_counts[digit] += 1
-        darknesses[digit] += sum(image)
-    avgs = defaultdict(float)
-    for digit, n in digit_counts.iteritems():
-        avgs[digit] = darknesses[digit] / n
-    return avgs
+        digit_counts[int(digit)] += 1
+        darknesses[int(digit)] += float(np.asarray(image).sum())
+    return defaultdict(
+        float,
+        {digit: darknesses[digit] / count for digit, count in digit_counts.items()},
+    )
 
-def guess_digit(image, avgs):
-    """Return the digit whose average darkness in the training data is
-    closest to the darkness of ``image``.  Note that ``avgs`` is
-    assumed to be a defaultdict whose keys are 0...9, and whose values
-    are the corresponding average darknesses across the training data."""
-    darkness = sum(image)
-    distances = {k: abs(v-darkness) for k, v in avgs.iteritems()}
-    return min(distances, key=distances.get)
+
+def guess_digit(image, avgs) -> int:
+    """Return the digit whose training average is closest to the image."""
+
+    darkness = float(np.asarray(image).sum())
+    return min(avgs, key=lambda digit: abs(avgs[digit] - darkness))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", type=Path, default=None)
+    parser.add_argument("--json", type=Path, default=None)
+    args = parser.parse_args(argv)
+
+    result = average_darkness(args.data)
+    print("Baseline classifier using average darkness of image.")
+    print(f"{result.correct} of {result.total} values correct ({result.accuracy:.2%}).")
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(result.as_dict(), indent=2), encoding="utf-8")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

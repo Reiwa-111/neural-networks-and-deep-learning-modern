@@ -1,297 +1,447 @@
-"""conv.py
-~~~~~~~~~~
+"""Chapter 6 experiments: convolutional networks on MNIST.
 
-Code for many of the experiments involving convolutional networks in
-Chapter 6 of the book 'Neural Networks and Deep Learning', by Michael
-Nielsen.  The code essentially duplicates (and parallels) what is in
-the text, so this is simply a convenience, and has not been commented
-in detail.  Consult the original text for more details.
-
+This is the modern replacement for the original Theano-based ``conv.py``.
+Every experiment uses :class:`nndl.models.ConvNet` and the shared training
+loop, so it runs on CPU, NVIDIA CUDA and AMD ROCm without code changes.
 """
 
-from collections import Counter
+from __future__ import annotations
+
+import argparse
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
 
 import matplotlib
-matplotlib.use('Agg')
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import theano
-import theano.tensor as T
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
-import network3
-from network3 import sigmoid, tanh, ReLU, Network
-from network3 import ConvPoolLayer, FullyConnectedLayer, SoftmaxLayer
+from nndl.config import TrainConfig, set_seed
+from nndl.data import MNISTBundle, load_mnist, make_dataloaders
+from nndl.models import MLP, ConvNet
+from nndl.trainer import History, Trainer, make_optimizer
 
-training_data, validation_data, test_data = network3.load_data_shared()
-mini_batch_size = 10
+DEFAULT_DATA = Path("data/mnist_expanded.npz")
 
-def shallow(n=3, epochs=60):
-    nets = []
+
+@dataclass
+class ExperimentResult:
+    name: str
+    trainer: Trainer
+    test_accuracy: float
+    history: History
+    expanded: bool = False
+
+
+def _bundle(*, expanded: bool = False, quick: bool = False) -> MNISTBundle:
+    path = DEFAULT_DATA if expanded else None
+    if expanded and not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. Run `python src/expand_mnist.py` or `nndl augment` first."
+        )
+    bundle = load_mnist(path, normalize=True)
+    if quick:
+        bundle = bundle.subset(2000, 1000)
+    return bundle
+
+
+def _run_model(
+    name: str,
+    model: nn.Module,
+    bundle: MNISTBundle,
+    *,
+    epochs: int,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+    weight_decay: float = 0.0,
+    optimizer_name: str = "adamw",
+    device: str = "auto",
+    amp: bool = True,
+    seed: int = 42,
+    expanded: bool = False,
+) -> ExperimentResult:
+    set_seed(seed)
+    train_loader, val_loader, test_loader = make_dataloaders(
+        bundle, batch_size=batch_size, seed=seed
+    )
+    config = TrainConfig(
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        optimizer=optimizer_name,
+        device=device,
+        seed=seed,
+        amp=amp,
+    )
+    optimizer = make_optimizer(model, config)
+    trainer = Trainer(
+        model,
+        nn.CrossEntropyLoss(),
+        optimizer,
+        config,
+        output_dir=Path("runs") / "conv" / name,
+    )
+    history = trainer.fit(train_loader, val_loader)
+    _, test_accuracy = trainer.evaluate(test_loader)
+    print(f"{name}: test accuracy {test_accuracy:.2%}")
+    return ExperimentResult(name, trainer, test_accuracy, history, expanded)
+
+
+def shallow(n: int = 3, epochs: int = 60, *, quick: bool = False, device: str = "auto"):
+    """A shallow 784-100-10 network used as a baseline."""
+
+    results = []
+    bundle = _bundle(quick=quick)
     for j in range(n):
-        print "A shallow net with 100 hidden neurons"
-        net = Network([
-            FullyConnectedLayer(n_in=784, n_out=100),
-            SoftmaxLayer(n_in=100, n_out=10)], mini_batch_size)
-        net.SGD(
-            training_data, epochs, mini_batch_size, 0.1, 
-            validation_data, test_data)
-        nets.append(net)
-    return nets 
+        model = MLP([784, 100, 10], hidden_activation="relu")
+        results.append(
+            _run_model(
+                f"shallow-{j}",
+                model,
+                bundle,
+                epochs=epochs,
+                device=device,
+                expanded=False,
+            )
+        )
+    return results
 
-def basic_conv(n=3, epochs=60):
+
+def basic_conv(n: int = 3, epochs: int = 60, *, quick: bool = False, device: str = "auto"):
+    """One convolution/pooling stage followed by a fully connected layer."""
+
+    results = []
+    bundle = _bundle(quick=quick)
     for j in range(n):
-        print "Conv + FC architecture"
-        net = Network([
-            ConvPoolLayer(image_shape=(mini_batch_size, 1, 28, 28), 
-                          filter_shape=(20, 1, 5, 5), 
-                          poolsize=(2, 2)),
-            FullyConnectedLayer(n_in=20*12*12, n_out=100),
-            SoftmaxLayer(n_in=100, n_out=10)], mini_batch_size)
-        net.SGD(
-            training_data, epochs, mini_batch_size, 0.1, validation_data, test_data)
-    return net 
+        model = ConvNet(
+            channels=(20,),
+            kernels=(5,),
+            fc_sizes=(100,),
+            activation="relu",
+        )
+        results.append(_run_model(f"basic-conv-{j}", model, bundle, epochs=epochs, device=device))
+    return results
 
-def omit_FC():
-    for j in range(3):
-        print "Conv only, no FC"
-        net = Network([
-            ConvPoolLayer(image_shape=(mini_batch_size, 1, 28, 28), 
-                          filter_shape=(20, 1, 5, 5), 
-                          poolsize=(2, 2)),
-            SoftmaxLayer(n_in=20*12*12, n_out=10)], mini_batch_size)
-        net.SGD(training_data, 60, mini_batch_size, 0.1, validation_data, test_data)
-    return net 
 
-def dbl_conv(activation_fn=sigmoid):
-    for j in range(3):
-        print "Conv + Conv + FC architecture"
-        net = Network([
-            ConvPoolLayer(image_shape=(mini_batch_size, 1, 28, 28), 
-                          filter_shape=(20, 1, 5, 5), 
-                          poolsize=(2, 2),
-                          activation_fn=activation_fn),
-            ConvPoolLayer(image_shape=(mini_batch_size, 20, 12, 12), 
-                          filter_shape=(40, 20, 5, 5), 
-                          poolsize=(2, 2),
-                          activation_fn=activation_fn),
-            FullyConnectedLayer(
-                n_in=40*4*4, n_out=100, activation_fn=activation_fn),
-            SoftmaxLayer(n_in=100, n_out=10)], mini_batch_size)
-        net.SGD(training_data, 60, mini_batch_size, 0.1, validation_data, test_data)
-    return net 
+def omit_FC(n: int = 3, epochs: int = 60, *, quick: bool = False, device: str = "auto"):
+    """Convolution/pooling followed directly by softmax."""
 
-# The following experiment was eventually omitted from the chapter,
-# but I've left it in here, since it's an important negative result:
-# basic l2 regularization didn't help much.  The reason (I believe) is
-# that using convolutional-pooling layers is already a pretty strong
-# regularizer.
-def regularized_dbl_conv():
-    for lmbda in [0.00001, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 100.0]:
-        for j in range(3):
-            print "Conv + Conv + FC num %s, with regularization %s" % (j, lmbda)
-            net = Network([
-                ConvPoolLayer(image_shape=(mini_batch_size, 1, 28, 28), 
-                              filter_shape=(20, 1, 5, 5), 
-                              poolsize=(2, 2)),
-                ConvPoolLayer(image_shape=(mini_batch_size, 20, 12, 12), 
-                              filter_shape=(40, 20, 5, 5), 
-                              poolsize=(2, 2)),
-                FullyConnectedLayer(n_in=40*4*4, n_out=100),
-                SoftmaxLayer(n_in=100, n_out=10)], mini_batch_size)
-            net.SGD(training_data, 60, mini_batch_size, 0.1, validation_data, test_data, lmbda=lmbda)
+    results = []
+    bundle = _bundle(quick=quick)
+    for j in range(n):
+        model = ConvNet(
+            channels=(20,),
+            kernels=(5,),
+            fc_sizes=(),
+            activation="relu",
+        )
+        results.append(_run_model(f"omit-fc-{j}", model, bundle, epochs=epochs, device=device))
+    return results
 
-def dbl_conv_relu():
-    for lmbda in [0.0, 0.00001, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 100.0]:
-        for j in range(3):
-            print "Conv + Conv + FC num %s, relu, with regularization %s" % (j, lmbda)
-            net = Network([
-                ConvPoolLayer(image_shape=(mini_batch_size, 1, 28, 28), 
-                              filter_shape=(20, 1, 5, 5), 
-                              poolsize=(2, 2), 
-                              activation_fn=ReLU),
-                ConvPoolLayer(image_shape=(mini_batch_size, 20, 12, 12), 
-                              filter_shape=(40, 20, 5, 5), 
-                              poolsize=(2, 2), 
-                              activation_fn=ReLU),
-                FullyConnectedLayer(n_in=40*4*4, n_out=100, activation_fn=ReLU),
-                SoftmaxLayer(n_in=100, n_out=10)], mini_batch_size)
-            net.SGD(training_data, 60, mini_batch_size, 0.03, validation_data, test_data, lmbda=lmbda)
 
-#### Some subsequent functions may make use of the expanded MNIST
-#### data.  That can be generated by running expand_mnist.py.
+def dbl_conv(
+    activation_fn: str = "sigmoid",
+    n: int = 3,
+    epochs: int = 60,
+    *,
+    quick: bool = False,
+    device: str = "auto",
+):
+    """Two convolution/pooling stages plus one fully connected layer."""
 
-def expanded_data(n=100):
-    """n is the number of neurons in the fully-connected layer.  We'll try
-    n=100, 300, and 1000.
+    results = []
+    bundle = _bundle(quick=quick)
+    for j in range(n):
+        model = ConvNet(
+            channels=(20, 40),
+            kernels=(5, 5),
+            fc_sizes=(100,),
+            activation=activation_fn,
+        )
+        results.append(
+            _run_model(
+                f"dbl-conv-{activation_fn}-{j}",
+                model,
+                bundle,
+                epochs=epochs,
+                device=device,
+            )
+        )
+    return results
 
-    """
-    expanded_training_data, _, _ = network3.load_data_shared(
-        "../data/mnist_expanded.pkl.gz")
-    for j in range(3):
-        print "Training with expanded data, %s neurons in the FC layer, run num %s" % (n, j)
-        net = Network([
-            ConvPoolLayer(image_shape=(mini_batch_size, 1, 28, 28), 
-                          filter_shape=(20, 1, 5, 5), 
-                          poolsize=(2, 2), 
-                          activation_fn=ReLU),
-            ConvPoolLayer(image_shape=(mini_batch_size, 20, 12, 12), 
-                          filter_shape=(40, 20, 5, 5), 
-                          poolsize=(2, 2), 
-                          activation_fn=ReLU),
-            FullyConnectedLayer(n_in=40*4*4, n_out=n, activation_fn=ReLU),
-            SoftmaxLayer(n_in=n, n_out=10)], mini_batch_size)
-        net.SGD(expanded_training_data, 60, mini_batch_size, 0.03, 
-                validation_data, test_data, lmbda=0.1)
-    return net 
 
-def expanded_data_double_fc(n=100):
-    """n is the number of neurons in both fully-connected layers.  We'll
-    try n=100, 300, and 1000.
+def regularized_dbl_conv(
+    lambdas: Sequence[float] = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1),
+    n: int = 1,
+    epochs: int = 60,
+    *,
+    quick: bool = False,
+    device: str = "auto",
+):
+    results = []
+    bundle = _bundle(quick=quick)
+    for lmbda in lambdas:
+        for j in range(n):
+            model = ConvNet(
+                channels=(20, 40),
+                kernels=(5, 5),
+                fc_sizes=(100,),
+                activation="sigmoid",
+            )
+            results.append(
+                _run_model(
+                    f"regularized-{lmbda:g}-{j}",
+                    model,
+                    bundle,
+                    epochs=epochs,
+                    weight_decay=lmbda,
+                    device=device,
+                )
+            )
+    return results
 
-    """
-    expanded_training_data, _, _ = network3.load_data_shared(
-        "../data/mnist_expanded.pkl.gz")
-    for j in range(3):
-        print "Training with expanded data, %s neurons in two FC layers, run num %s" % (n, j)
-        net = Network([
-            ConvPoolLayer(image_shape=(mini_batch_size, 1, 28, 28), 
-                          filter_shape=(20, 1, 5, 5), 
-                          poolsize=(2, 2), 
-                          activation_fn=ReLU),
-            ConvPoolLayer(image_shape=(mini_batch_size, 20, 12, 12), 
-                          filter_shape=(40, 20, 5, 5), 
-                          poolsize=(2, 2), 
-                          activation_fn=ReLU),
-            FullyConnectedLayer(n_in=40*4*4, n_out=n, activation_fn=ReLU),
-            FullyConnectedLayer(n_in=n, n_out=n, activation_fn=ReLU),
-            SoftmaxLayer(n_in=n, n_out=10)], mini_batch_size)
-        net.SGD(expanded_training_data, 60, mini_batch_size, 0.03, 
-                validation_data, test_data, lmbda=0.1)
 
-def double_fc_dropout(p0, p1, p2, repetitions):
-    expanded_training_data, _, _ = network3.load_data_shared(
-        "../data/mnist_expanded.pkl.gz")
-    nets = []
+def dbl_conv_relu(n: int = 3, epochs: int = 60, *, quick: bool = False, device: str = "auto"):
+    return dbl_conv("relu", n=n, epochs=epochs, quick=quick, device=device)
+
+
+def expanded_data(
+    n_fc: int = 100, n: int = 3, epochs: int = 60, *, quick: bool = False, device: str = "auto"
+):
+    """Train on the 250k-image expanded dataset."""
+
+    results = []
+    bundle = _bundle(expanded=True, quick=quick)
+    for j in range(n):
+        model = ConvNet(
+            channels=(20, 40),
+            kernels=(5, 5),
+            fc_sizes=(n_fc,),
+            activation="relu",
+        )
+        results.append(
+            _run_model(
+                f"expanded-{n_fc}-{j}",
+                model,
+                bundle,
+                epochs=epochs,
+                device=device,
+                expanded=True,
+            )
+        )
+    return results
+
+
+def expanded_data_double_fc(
+    n_fc: int = 100, n: int = 3, epochs: int = 60, *, quick: bool = False, device: str = "auto"
+):
+    results = []
+    bundle = _bundle(expanded=True, quick=quick)
+    for j in range(n):
+        model = ConvNet(
+            channels=(20, 40),
+            kernels=(5, 5),
+            fc_sizes=(n_fc, n_fc),
+            activation="relu",
+        )
+        results.append(
+            _run_model(
+                f"expanded-double-{n_fc}-{j}",
+                model,
+                bundle,
+                epochs=epochs,
+                device=device,
+                expanded=True,
+            )
+        )
+    return results
+
+
+def double_fc_dropout(
+    p0: float,
+    p1: float,
+    p2: float,
+    repetitions: int,
+    *,
+    epochs: int = 40,
+    quick: bool = False,
+    device: str = "auto",
+):
+    results = []
+    bundle = _bundle(expanded=True, quick=quick)
     for j in range(repetitions):
-        print "\n\nTraining using a dropout network with parameters ",p0,p1,p2
-        print "Training with expanded data, run num %s" % j
-        net = Network([
-            ConvPoolLayer(image_shape=(mini_batch_size, 1, 28, 28), 
-                          filter_shape=(20, 1, 5, 5), 
-                          poolsize=(2, 2), 
-                          activation_fn=ReLU),
-            ConvPoolLayer(image_shape=(mini_batch_size, 20, 12, 12), 
-                          filter_shape=(40, 20, 5, 5), 
-                          poolsize=(2, 2), 
-                          activation_fn=ReLU),
-            FullyConnectedLayer(
-                n_in=40*4*4, n_out=1000, activation_fn=ReLU, p_dropout=p0),
-            FullyConnectedLayer(
-                n_in=1000, n_out=1000, activation_fn=ReLU, p_dropout=p1),
-            SoftmaxLayer(n_in=1000, n_out=10, p_dropout=p2)], mini_batch_size)
-        net.SGD(expanded_training_data, 40, mini_batch_size, 0.03, 
-                validation_data, test_data)
-        nets.append(net)
-    return nets
+        print(f"Training dropout network {j + 1}/{repetitions}: p=({p0}, {p1}, {p2})")
+        model = ConvNet(
+            channels=(20, 40),
+            kernels=(5, 5),
+            fc_sizes=(1000, 1000),
+            activation="relu",
+            dropout=(p0, p1),
+            output_dropout=p2,
+        )
+        results.append(
+            _run_model(
+                f"dropout-{p0}-{p1}-{p2}-{j}",
+                model,
+                bundle,
+                epochs=epochs,
+                device=device,
+                expanded=True,
+            )
+        )
+    return results
 
-def ensemble(nets): 
-    """Takes as input a list of nets, and then computes the accuracy on
-    the test data when classifications are computed by taking a vote
-    amongst the nets.  Returns a tuple containing a list of indices
-    for test data which is erroneously classified, and a list of the
-    corresponding erroneous predictions.
 
-    Note that this is a quick-and-dirty kluge: it'd be more reusable
-    (and faster) to define a Theano function taking the vote.  But
-    this works.
+def ensemble(results: Sequence[ExperimentResult]) -> tuple[list[int], list[int]]:
+    """Majority vote over several trained networks."""
 
-    """
-    
-    test_x, test_y = test_data
-    for net in nets:
-        i = T.lscalar() # mini-batch index
-        net.test_mb_predictions = theano.function(
-            [i], net.layers[-1].y_out,
-            givens={
-                net.x: 
-                test_x[i*net.mini_batch_size: (i+1)*net.mini_batch_size]
-            })
-        net.test_predictions = list(np.concatenate(
-            [net.test_mb_predictions(i) for i in xrange(1000)]))
-    all_test_predictions = zip(*[net.test_predictions for net in nets])
-    def plurality(p): return Counter(p).most_common(1)[0][0]
-    plurality_test_predictions = [plurality(p) 
-                                  for p in all_test_predictions]
-    test_y_eval = test_y.eval()
-    error_locations = [j for j in xrange(10000) 
-                       if plurality_test_predictions[j] != test_y_eval[j]]
-    erroneous_predictions = [plurality(all_test_predictions[j])
-                             for j in error_locations]
-    print "Accuracy is {:.2%}".format((1-len(error_locations)/10000.0))
-    return error_locations, erroneous_predictions
+    if not results:
+        raise ValueError("ensemble requires at least one trained model")
+    bundle = load_mnist(normalize=True)
+    loader = DataLoader(
+        TensorDataset(bundle.test_x, bundle.test_y),
+        batch_size=1024,
+        shuffle=False,
+    )
+    predictions = torch.stack([result.trainer.predict(loader) for result in results])
+    majority = torch.mode(predictions, dim=0).values
+    errors = (majority != bundle.test_y).nonzero(as_tuple=False).flatten()
+    print(f"Ensemble accuracy: {1 - len(errors) / len(bundle.test_y):.2%}")
+    return errors.tolist(), majority[errors].tolist()
 
-def plot_errors(error_locations, erroneous_predictions=None):
-    test_x, test_y = test_data[0].eval(), test_data[1].eval()
-    fig = plt.figure()
-    error_images = [np.array(test_x[i]).reshape(28, -1) for i in error_locations]
+
+def plot_errors(
+    error_locations: Sequence[int],
+    erroneous_predictions: Sequence[int] | None = None,
+    *,
+    output: str | Path = "ensemble_errors.png",
+) -> Path:
+    bundle = load_mnist(normalize=True)
     n = min(40, len(error_locations))
+    fig, axes = plt.subplots(5, 8, figsize=(10, 6.5))
+    axes = axes.ravel()
+    for axis in axes:
+        axis.axis("off")
     for j in range(n):
-        ax = plt.subplot2grid((5, 8), (j/8, j % 8))
-        ax.matshow(error_images[j], cmap = matplotlib.cm.binary)
-        ax.text(24, 5, test_y[error_locations[j]])
-        if erroneous_predictions:
-            ax.text(24, 24, erroneous_predictions[j])
-        plt.xticks(np.array([]))
-        plt.yticks(np.array([]))
-    plt.tight_layout()
-    return plt
-    
-def plot_filters(net, layer, x, y):
-
-    """Plot the filters for net after the (convolutional) layer number
-    layer.  They are plotted in x by y format.  So, for example, if we
-    have 20 filters after layer 0, then we can call show_filters(net, 0, 5, 4) to
-    get a 5 by 4 plot of all filters."""
-    filters = net.layers[layer].w.eval()
-    fig = plt.figure()
-    for j in range(len(filters)):
-        ax = fig.add_subplot(y, x, j)
-        ax.matshow(filters[j][0], cmap = matplotlib.cm.binary)
-        plt.xticks(np.array([]))
-        plt.yticks(np.array([]))
-    plt.tight_layout()
-    return plt
+        index = error_locations[j]
+        axes[j].imshow(bundle.test_x[index, 0].numpy(), cmap="gray")
+        axes[j].set_title(str(int(bundle.test_y[index])), fontsize=8)
+        if erroneous_predictions is not None:
+            axes[j].set_xlabel(str(int(erroneous_predictions[j])), fontsize=8, color="red")
+    fig.tight_layout()
+    output = Path(output)
+    fig.savefig(output, dpi=150)
+    plt.close(fig)
+    return output
 
 
-#### Helper method to run all experiments in the book
+def plot_filters(
+    net,
+    layer: int,
+    x: int,
+    y: int,
+    *,
+    output: str | Path = "net_filters.png",
+) -> Path:
+    model = net.trainer.unwrap_model() if isinstance(net, ExperimentResult) else net
+    filters = model.conv_layers[layer].weight.detach().cpu()
+    fig, axes = plt.subplots(y, x, figsize=(x * 1.5, y * 1.5))
+    axes = np.asarray(axes).ravel()
+    for axis in axes:
+        axis.axis("off")
+    for j in range(min(len(filters), len(axes))):
+        axes[j].imshow(filters[j, 0].numpy(), cmap="gray")
+    fig.tight_layout()
+    output = Path(output)
+    fig.savefig(output, dpi=150)
+    plt.close(fig)
+    return output
 
-def run_experiments():
 
-    """Run the experiments described in the book.  Note that the later
-    experiments require access to the expanded training data, which
-    can be generated by running expand_mnist.py.
+def run_experiments(*, quick: bool = False, device: str = "auto") -> None:
+    n = 1 if quick else 3
+    epochs = 2 if quick else 60
+    shallow(n=n, epochs=epochs, quick=quick, device=device)
+    basic_conv(n=n, epochs=epochs, quick=quick, device=device)
+    omit_FC(n=n, epochs=epochs, quick=quick, device=device)
+    dbl_conv(n=n, epochs=epochs, quick=quick, device=device)
+    dbl_conv_relu(n=n, epochs=epochs, quick=quick, device=device)
+    try:
+        expanded_data(n_fc=100, n=n, epochs=epochs, quick=quick, device=device)
+        expanded_data_double_fc(n_fc=100, n=n, epochs=epochs, quick=quick, device=device)
+        nets = double_fc_dropout(
+            0.5, 0.5, 0.5, repetitions=n, epochs=epochs, quick=quick, device=device
+        )
+        errors, predictions = ensemble(nets)
+        print(plot_errors(errors, predictions))
+        print(plot_filters(nets[0], 0, 5, 4, output="net_full_layer_0.png"))
+        print(plot_filters(nets[0], 1, 8, 5, output="net_full_layer_1.png"))
+    except FileNotFoundError as exc:
+        print(f"Skipping expanded-data experiments: {exc}")
 
-    """
-    shallow()
-    basic_conv()
-    omit_FC()
-    dbl_conv(activation_fn=sigmoid)
-    # omitted, but still interesting: regularized_dbl_conv()
-    dbl_conv_relu()
-    expanded_data(n=100)
-    expanded_data(n=300)
-    expanded_data(n=1000)
-    expanded_data_double_fc(n=100)    
-    expanded_data_double_fc(n=300)
-    expanded_data_double_fc(n=1000)
-    nets = double_fc_dropout(0.5, 0.5, 0.5, 5)
-    # plot the erroneous digits in the ensemble of nets just trained
-    error_locations, erroneous_predictions = ensemble(nets)
-    plt = plot_errors(error_locations, erroneous_predictions)
-    plt.savefig("ensemble_errors.png")
-    # plot the filters learned by the first of the nets just trained
-    plt = plot_filters(nets[0], 0, 5, 4)
-    plt.savefig("net_full_layer_0.png")
-    plt = plot_filters(nets[0], 1, 8, 5)
-    plt.savefig("net_full_layer_1.png")
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "experiment",
+        nargs="?",
+        default="all",
+        choices=[
+            "all",
+            "shallow",
+            "basic_conv",
+            "omit_fc",
+            "dbl_conv",
+            "dbl_conv_relu",
+            "regularized",
+            "expanded",
+            "expanded_double_fc",
+            "dropout",
+        ],
+    )
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args(argv)
+    set_seed(args.seed)
+
+    quick = args.quick
+    epochs = args.epochs if args.epochs is not None else (2 if quick else 60)
+    n = 1 if quick else 3
+
+    if args.experiment == "all":
+        run_experiments(quick=quick, device=args.device)
+    elif args.experiment == "shallow":
+        shallow(n=n, epochs=epochs, quick=quick, device=args.device)
+    elif args.experiment == "basic_conv":
+        basic_conv(n=n, epochs=epochs, quick=quick, device=args.device)
+    elif args.experiment == "omit_fc":
+        omit_FC(n=n, epochs=epochs, quick=quick, device=args.device)
+    elif args.experiment == "dbl_conv":
+        dbl_conv(n=n, epochs=epochs, quick=quick, device=args.device)
+    elif args.experiment == "dbl_conv_relu":
+        dbl_conv_relu(n=n, epochs=epochs, quick=quick, device=args.device)
+    elif args.experiment == "regularized":
+        regularized_dbl_conv(n=n, epochs=epochs, quick=quick, device=args.device)
+    elif args.experiment == "expanded":
+        expanded_data(n_fc=100, n=n, epochs=epochs, quick=quick, device=args.device)
+    elif args.experiment == "expanded_double_fc":
+        expanded_data_double_fc(n_fc=100, n=n, epochs=epochs, quick=quick, device=args.device)
+    elif args.experiment == "dropout":
+        nets = double_fc_dropout(
+            0.5, 0.5, 0.5, repetitions=n, epochs=epochs, quick=quick, device=args.device
+        )
+        errors, predictions = ensemble(nets)
+        print(plot_errors(errors, predictions))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

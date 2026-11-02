@@ -35,18 +35,35 @@ involved some minor hacking around with backprop2, which messed up
 that code.  That's why I've simply put the results in by hand below.
 """
 
+from pathlib import Path
+
 # Third-party libraries
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-nw1 = [0.129173436407863, 0.4242933114455002, 
-       1.6154682713449411, 7.5451567587160069]
-nw2 = [0.12571016850457151, 0.44231149185805047, 
-       1.8435833504677326, 7.61973813981073]
-nw3 = [0.15854489503205446, 0.70244235144444678, 
-       2.6294803575724157, 10.427062019753425]
-plt.plot(range(1, 5), nw1, "ro-", range(1, 5), nw2, "go-", 
-         range(1, 5), nw3, "bo-")
-plt.xlabel('Layer $l$')
-plt.ylabel(r"$\Vert\nabla C^l_w\Vert$")
-plt.xticks([1, 2, 3, 4])
-plt.show()
+OUTPUT_DIR = Path(__file__).resolve().parent
+
+# Norms of the (unregularized) gradient for mini-batches 7, 8 and 9.
+nw1 = [0.129173436407863, 0.4242933114455002, 1.6154682713449411, 7.5451567587160069]
+nw2 = [0.12571016850457151, 0.44231149185805047, 1.8435833504677326, 7.61973813981073]
+nw3 = [0.15854489503205446, 0.70244235144444678, 2.6294803575724157, 10.427062019753425]
+
+
+def main():
+    fig, ax = plt.subplots()
+    layers = range(1, 5)
+    ax.plot(layers, nw1, "ro-", label="mini-batch 7")
+    ax.plot(layers, nw2, "go-", label="mini-batch 8")
+    ax.plot(layers, nw3, "bo-", label="mini-batch 9")
+    ax.set_xlabel("Layer $l$")
+    ax.set_ylabel(r"$\Vert\nabla C^l_w\Vert$")
+    ax.set_xticks([1, 2, 3, 4])
+    ax.legend()
+    fig.savefig(OUTPUT_DIR / "backprop_magnitude_nabla.png", dpi=150)
+    plt.close(fig)
+
+
+if __name__ == "__main__":
+    main()

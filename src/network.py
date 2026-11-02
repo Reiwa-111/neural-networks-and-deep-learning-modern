@@ -1,141 +1,185 @@
-"""
-network.py
-~~~~~~~~~~
+"""Chapter 1 network: a minimal fully connected classifier.
 
-A module to implement the stochastic gradient descent learning
-algorithm for a feedforward neural network.  Gradients are calculated
-using backpropagation.  Note that I have focused on making the code
-simple, easily readable, and easily modifiable.  It is not optimized,
-and omits many desirable features.
+The public API is unchanged (``Network(sizes).SGD(...)``), but gradients are
+now computed by PyTorch and the model runs on the best available device.
 """
 
-#### Libraries
-# Standard library
-import random
+from __future__ import annotations
 
-# Third-party libraries
+import time
+from collections.abc import Iterable, Sequence
+from pathlib import Path
+
 import numpy as np
+import torch
+from torch.utils.data import DataLoader, TensorDataset
 
-class Network(object):
+from nndl.config import TrainConfig, resolve_device
+from nndl.losses import QuadraticLoss, ZeroLoss
+from nndl.models import MLP
+from nndl.trainer import Trainer
 
-    def __init__(self, sizes):
-        """The list ``sizes`` contains the number of neurons in the
-        respective layers of the network.  For example, if the list
-        was [2, 3, 1] then it would be a three-layer network, with the
-        first layer containing 2 neurons, the second layer 3 neurons,
-        and the third layer 1 neuron.  The biases and weights for the
-        network are initialized randomly, using a Gaussian
-        distribution with mean 0, and variance 1.  Note that the first
-        layer is assumed to be an input layer, and by convention we
-        won't set any biases for those neurons, since biases are only
-        ever used in computing the outputs from later layers."""
-        self.num_layers = len(sizes)
-        self.sizes = sizes
-        self.biases = [np.random.randn(y, 1) for y in sizes[1:]]
-        self.weights = [np.random.randn(y, x)
-                        for x, y in zip(sizes[:-1], sizes[1:])]
+__all__ = ["Network", "sigmoid", "sigmoid_prime"]
 
-    def feedforward(self, a):
-        """Return the output of the network if ``a`` is input."""
-        for b, w in zip(self.biases, self.weights):
-            a = sigmoid(np.dot(w, a)+b)
-        return a
 
-    def SGD(self, training_data, epochs, mini_batch_size, eta,
-            test_data=None):
-        """Train the neural network using mini-batch stochastic
-        gradient descent.  The ``training_data`` is a list of tuples
-        ``(x, y)`` representing the training inputs and the desired
-        outputs.  The other non-optional parameters are
-        self-explanatory.  If ``test_data`` is provided then the
-        network will be evaluated against the test data after each
-        epoch, and partial progress printed out.  This is useful for
-        tracking progress, but slows things down substantially."""
-        if test_data: n_test = len(test_data)
-        n = len(training_data)
-        for j in xrange(epochs):
-            random.shuffle(training_data)
-            mini_batches = [
-                training_data[k:k+mini_batch_size]
-                for k in xrange(0, n, mini_batch_size)]
-            for mini_batch in mini_batches:
-                self.update_mini_batch(mini_batch, eta)
-            if test_data:
-                print "Epoch {0}: {1} / {2}".format(
-                    j, self.evaluate(test_data), n_test)
+def _as_input(value) -> torch.Tensor:
+    array = np.asarray(value, dtype=np.float32)
+    return torch.from_numpy(array)
+
+
+class Network:
+    """Feedforward network with sigmoid units and a quadratic cost."""
+
+    def __init__(self, sizes: Sequence[int]) -> None:
+        self.sizes = list(sizes)
+        self.device = resolve_device("auto")
+        self.model = MLP(
+            self.sizes,
+            hidden_activation="sigmoid",
+            output_activation="sigmoid",
+        ).to(self.device)
+
+    # ------------------------------------------------------------------ inference
+    def feedforward(self, a) -> np.ndarray:
+        """Return the network output for a single input (or a batch)."""
+
+        tensor = _as_input(a)
+        single = tensor.dim() == 1 or (tensor.dim() == 2 and tensor.shape[1] == 1)
+        if single:
+            tensor = tensor.reshape(1, -1)
+        tensor = tensor.to(self.device)
+        with torch.inference_mode():
+            output = self.model(tensor).cpu().numpy()
+        return output.reshape(-1, 1) if single else output
+
+    def evaluate(self, test_data) -> int:
+        """Number of correctly classified examples."""
+
+        x, y = _split_pairs(test_data, one_hot=False)
+        loader = DataLoader(
+            TensorDataset(x, y),
+            batch_size=1024,
+            shuffle=False,
+            pin_memory=torch.cuda.is_available(),
+        )
+        trainer = Trainer(
+            self.model,
+            ZeroLoss(),
+            torch.optim.SGD(self.model.parameters(), lr=0.0),
+            TrainConfig(epochs=0, batch_size=1024, lr=1e-12, amp=False, device=str(self.device)),
+        )
+        _, accuracy = trainer.evaluate(loader)
+        return round(accuracy * len(y))
+
+    # ------------------------------------------------------------------ training
+    def SGD(
+        self,
+        training_data,
+        epochs: int,
+        mini_batch_size: int,
+        eta: float,
+        test_data=None,
+    ) -> None:
+        """Train with mini-batch stochastic gradient descent."""
+
+        x, y = _split_pairs(training_data, one_hot=True)
+        loader = DataLoader(
+            TensorDataset(x, y),
+            batch_size=mini_batch_size,
+            shuffle=True,
+            pin_memory=torch.cuda.is_available(),
+        )
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=eta)
+        trainer = Trainer(
+            self.model,
+            QuadraticLoss(),
+            optimizer,
+            TrainConfig(
+                epochs=epochs,
+                batch_size=mini_batch_size,
+                lr=eta,
+                amp=False,
+                device=str(self.device),
+            ),
+        )
+
+        test_loader = None
+        if test_data:
+            test_x, test_y = _split_pairs(test_data, one_hot=False)
+            test_loader = DataLoader(
+                TensorDataset(test_x, test_y),
+                batch_size=1024,
+                shuffle=False,
+                pin_memory=torch.cuda.is_available(),
+            )
+            # The training objective is quadratic on one-hot targets; test
+            # labels are integers, so accuracy is measured with ZeroLoss.
+            test_trainer = Trainer(
+                self.model,
+                ZeroLoss(),
+                torch.optim.SGD(self.model.parameters(), lr=0.0),
+                TrainConfig(
+                    epochs=0, batch_size=1024, lr=1e-12, amp=False, device=str(self.device)
+                ),
+            )
+
+        n_test = len(test_data) if test_data else 0
+        for epoch in range(epochs):
+            started = time.perf_counter()
+            trainer.train_epoch(loader)
+            elapsed = time.perf_counter() - started
+            if test_loader is not None:
+                _, accuracy = test_trainer.evaluate(test_loader)
+                correct = round(accuracy * n_test)
+                print(f"Epoch {epoch}: {correct} / {n_test}, took {elapsed:.2f} seconds")
             else:
-                print "Epoch {0} complete".format(j)
+                print(f"Epoch {epoch} complete in {elapsed:.2f} seconds")
 
-    def update_mini_batch(self, mini_batch, eta):
-        """Update the network's weights and biases by applying
-        gradient descent using backpropagation to a single mini batch.
-        The ``mini_batch`` is a list of tuples ``(x, y)``, and ``eta``
-        is the learning rate."""
-        nabla_b = [np.zeros(b.shape) for b in self.biases]
-        nabla_w = [np.zeros(w.shape) for w in self.weights]
-        for x, y in mini_batch:
-            delta_nabla_b, delta_nabla_w = self.backprop(x, y)
-            nabla_b = [nb+dnb for nb, dnb in zip(nabla_b, delta_nabla_b)]
-            nabla_w = [nw+dnw for nw, dnw in zip(nabla_w, delta_nabla_w)]
-        self.weights = [w-(eta/len(mini_batch))*nw
-                        for w, nw in zip(self.weights, nabla_w)]
-        self.biases = [b-(eta/len(mini_batch))*nb
-                       for b, nb in zip(self.biases, nabla_b)]
+    # ------------------------------------------------------------------ persistence
+    def save(self, filename: str | Path) -> None:
+        torch.save(
+            {"sizes": self.sizes, "state_dict": self.model.state_dict()},
+            filename,
+        )
 
-    def backprop(self, x, y):
-        """Return a tuple ``(nabla_b, nabla_w)`` representing the
-        gradient for the cost function C_x.  ``nabla_b`` and
-        ``nabla_w`` are layer-by-layer lists of numpy arrays, similar
-        to ``self.biases`` and ``self.weights``."""
-        nabla_b = [np.zeros(b.shape) for b in self.biases]
-        nabla_w = [np.zeros(w.shape) for w in self.weights]
-        # feedforward
-        activation = x
-        activations = [x] # list to store all the activations, layer by layer
-        zs = [] # list to store all the z vectors, layer by layer
-        for b, w in zip(self.biases, self.weights):
-            z = np.dot(w, activation)+b
-            zs.append(z)
-            activation = sigmoid(z)
-            activations.append(activation)
-        # backward pass
-        delta = self.cost_derivative(activations[-1], y) * \
-            sigmoid_prime(zs[-1])
-        nabla_b[-1] = delta
-        nabla_w[-1] = np.dot(delta, activations[-2].transpose())
-        # Note that the variable l in the loop below is used a little
-        # differently to the notation in Chapter 2 of the book.  Here,
-        # l = 1 means the last layer of neurons, l = 2 is the
-        # second-last layer, and so on.  It's a renumbering of the
-        # scheme in the book, used here to take advantage of the fact
-        # that Python can use negative indices in lists.
-        for l in xrange(2, self.num_layers):
-            z = zs[-l]
-            sp = sigmoid_prime(z)
-            delta = np.dot(self.weights[-l+1].transpose(), delta) * sp
-            nabla_b[-l] = delta
-            nabla_w[-l] = np.dot(delta, activations[-l-1].transpose())
-        return (nabla_b, nabla_w)
+    @classmethod
+    def load(cls, filename: str | Path) -> Network:
+        checkpoint = torch.load(filename, map_location="cpu", weights_only=False)
+        network = cls(checkpoint["sizes"])
+        network.model.load_state_dict(checkpoint["state_dict"])
+        return network
 
-    def evaluate(self, test_data):
-        """Return the number of test inputs for which the neural
-        network outputs the correct result. Note that the neural
-        network's output is assumed to be the index of whichever
-        neuron in the final layer has the highest activation."""
-        test_results = [(np.argmax(self.feedforward(x)), y)
-                        for (x, y) in test_data]
-        return sum(int(x == y) for (x, y) in test_results)
-
+    # ------------------------------------------------------------------ compatibility
     def cost_derivative(self, output_activations, y):
-        """Return the vector of partial derivatives \partial C_x /
-        \partial a for the output activations."""
-        return (output_activations-y)
+        return np.asarray(output_activations) - np.asarray(y)
 
-#### Miscellaneous functions
+
+def _split_pairs(data: Iterable, *, one_hot: bool):
+    """Convert the book's list-of-pairs into flattened tensors."""
+
+    xs = []
+    ys = []
+    labels = []
+    for x, y in data:
+        xs.append(np.asarray(x, dtype=np.float32).reshape(-1))
+        ys.append(np.asarray(y, dtype=np.float32).reshape(-1))
+        labels.append(int(np.asarray(y).reshape(-1)[0]))
+    x_tensor = torch.from_numpy(np.stack(xs))
+    if one_hot:
+        y_tensor = torch.from_numpy(np.stack(ys))
+    else:
+        y_tensor = torch.from_numpy(np.asarray(labels, dtype=np.int64))
+    return x_tensor, y_tensor
+
+
 def sigmoid(z):
-    """The sigmoid function."""
-    return 1.0/(1.0+np.exp(-z))
+    """The sigmoid function (NumPy compatible)."""
+
+    return 1.0 / (1.0 + np.exp(-np.asarray(z)))
+
 
 def sigmoid_prime(z):
     """Derivative of the sigmoid function."""
-    return sigmoid(z)*(1-sigmoid(z))
+
+    s = sigmoid(z)
+    return s * (1 - s)

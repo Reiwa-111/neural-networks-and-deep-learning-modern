@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nndl-modern"
+version = "2.0.1"
+description = "Modern PyTorch implementation of the code samples for Neural Networks and Deep Learning"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Contributors to the PyTorch modernization" }]
+dependencies = [
+    "numpy>=1.26",
+    "torch>=2.4",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.9"]
+baselines = ["scikit-learn>=1.5"]
+data = ["torchvision>=0.19"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+nndl = "nndl.cli:main"
+
+[tool.setuptools]
+py-modules = [
+    "conv",
+    "expand_mnist",
+    "mnist_average_darkness",
+    "mnist_loader",
+    "mnist_svm",
+    "network",
+    "network2",
+    "network3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "slow: long-running training or baseline tests",
+    "gpu: requires a CUDA/ROCm device",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

@@ -1,119 +1,214 @@
-"""generate_gradient.py
-~~~~~~~~~~~~~~~~~~~~~~~
+"""Gradient-magnitude experiments from chapter 5.
 
-Use network2 to figure out the average starting values of the gradient
-error terms \delta^l_j = \partial C / \partial z^l_j = \partial C /
-\partial b^l_j.
+Compute the average bias gradient (the ``delta`` terms) with
+``network2.Network.backprop`` and record how its norm evolves while training
+networks with two, three and four hidden layers.
 
+The committed JSON files are reused by default so that running the script
+simply regenerates the PNGs.  Pass ``--recompute`` (optionally with
+``--quick``) to retrain.
 """
 
-#### Libraries
-# Standard library
+from __future__ import annotations
+
+import argparse
 import json
-import math
-import random
-import shutil
 import sys
-sys.path.append("../src/")
+from pathlib import Path
 
-# My library
-import mnist_loader
-import network2
-
-# Third-party libraries
-import matplotlib.pyplot as plt
 import numpy as np
 
-def main():
-    # Load the data
-    full_td, _, _ = mnist_loader.load_data_wrapper()
-    td = full_td[:1000] # Just use the first 1000 items of training data
-    epochs = 500 # Number of epochs to train for
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+FIG_DIR = Path(__file__).resolve().parent
 
-    print "\nTwo hidden layers:"
-    net = network2.Network([784, 30, 30, 10])
-    initial_norms(td, net)
-    abbreviated_gradient = [
-        ag[:6] for ag in get_average_gradient(net, td)[:-1]] 
-    print "Saving the averaged gradient for the top six neurons in each "+\
-        "layer.\nWARNING: This will affect the look of the book, so be "+\
-        "sure to check the\nrelevant material (early chapter 5)."
-    f = open("initial_gradient.json", "w")
-    json.dump(abbreviated_gradient, f)
-    f.close()
-    shutil.copy("initial_gradient.json", "../../js/initial_gradient.json")
-    training(td, net, epochs, "norms_during_training_2_layers.json")
-    plot_training(
-        epochs, "norms_during_training_2_layers.json", 2)
+import matplotlib
 
-    print "\nThree hidden layers:"
-    net = network2.Network([784, 30, 30, 30, 10])
-    initial_norms(td, net)
-    training(td, net, epochs, "norms_during_training_3_layers.json")
-    plot_training(
-        epochs, "norms_during_training_3_layers.json", 3)
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from torch.utils.data import TensorDataset
 
-    print "\nFour hidden layers:"
-    net = network2.Network([784, 30, 30, 30, 30, 10])
-    initial_norms(td, net)
-    training(td, net, epochs, 
-             "norms_during_training_4_layers.json")
-    plot_training(
-        epochs, "norms_during_training_4_layers.json", 4)
+import network2
+from nndl.config import set_seed
+from nndl.data import load_mnist, to_one_hot
 
-def initial_norms(training_data, net):
-    average_gradient = get_average_gradient(net, training_data)
-    norms = [list_norm(avg) for avg in average_gradient[:-1]]
-    print "Average gradient for the hidden layers: "+str(norms)
-    
-def training(training_data, net, epochs, filename):
-    norms = []
-    for j in range(epochs):
-        average_gradient = get_average_gradient(net, training_data)
-        norms.append([list_norm(avg) for avg in average_gradient[:-1]])
-        print "Epoch: %s" % j
-        net.SGD(training_data, 1, 1000, 0.1, lmbda=5.0)
-    f = open(filename, "w")
-    json.dump(norms, f)
-    f.close()
+ARCHITECTURES = {
+    2: [784, 30, 30, 10],
+    3: [784, 30, 30, 30, 10],
+    4: [784, 30, 30, 30, 30, 10],
+}
+COLORS = ["#2A6EA6", "#FFA933", "#FF5555", "#55FF55", "#5555FF"]
 
-def plot_training(epochs, filename, num_layers):
-    f = open(filename, "r")
-    norms = json.load(f)
-    f.close()
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    colors = ["#2A6EA6", "#FFA933", "#FF5555", "#55FF55", "#5555FF"]
-    for j in range(num_layers):
-        ax.plot(np.arange(epochs), 
-                [n[j] for n in norms], 
-                color=colors[j],
-                label="Hidden layer %s" % (j+1,))
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--recompute",
+        action="store_true",
+        help="retrain the networks instead of reusing the committed JSON files",
+    )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="tiny smoke-test training run (1 epoch, 200 examples)",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=None, help="epochs per network (default: 30, quick: 1)"
+    )
+    parser.add_argument(
+        "--train-size", type=int, default=None, help="training examples (default: 1000, quick: 200)"
+    )
+    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--eta", type=float, default=0.1)
+    parser.add_argument("--lmbda", type=float, default=5.0)
+    parser.add_argument("--seed", type=int, default=12345678)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=FIG_DIR,
+        help="directory for JSON/PNG outputs (default: this script's directory)",
+    )
+    args = parser.parse_args(argv)
+    if args.epochs is None:
+        args.epochs = 1 if args.quick else 30
+    if args.train_size is None:
+        args.train_size = 200 if args.quick else 1000
+    return args
+
+
+def make_dataset(size: int) -> TensorDataset:
+    bundle = load_mnist(flatten=True)
+    x = bundle.train_x[:size]
+    y = to_one_hot(bundle.train_y[:size])
+    return TensorDataset(x, y)
+
+
+def average_bias_gradient(net: network2.Network, data: TensorDataset) -> list[np.ndarray]:
+    """Average ``dC/db`` over every example in ``data``."""
+    total: list[np.ndarray] | None = None
+    for x, y in data:
+        nabla_b, _ = net.backprop(x.numpy(), y.numpy())
+        if total is None:
+            total = [np.zeros_like(g) for g in nabla_b]
+        for accumulator, gradient in zip(total, nabla_b):
+            accumulator += gradient
+    if total is None:
+        raise ValueError("cannot average gradients of an empty dataset")
+    return [g / len(data) for g in total]
+
+
+def initial_gradient(net: network2.Network, data: TensorDataset) -> list[list[float]]:
+    """Top six components of the hidden-layer bias gradient (book format)."""
+    averaged = average_bias_gradient(net, data)
+    return [g.reshape(-1)[:6].tolist() for g in averaged[:-1]]
+
+
+def train_and_record(
+    net: network2.Network, data: TensorDataset, args: argparse.Namespace
+) -> list[list[float]]:
+    norms: list[list[float]] = []
+    for epoch in range(args.epochs):
+        averaged = average_bias_gradient(net, data)
+        norms.append([float(np.linalg.norm(g)) for g in averaged[:-1]])
+        print(f"Epoch {epoch}: hidden-layer gradient norms {norms[-1]}")
+        net.SGD(data, 1, args.batch_size, args.eta, lmbda=args.lmbda)
+    return norms
+
+
+def compute_all(args: argparse.Namespace, recompute: bool) -> bool:
+    """Compute whichever artifacts are missing (or all of them)."""
+    out = args.output_dir
+    out.mkdir(parents=True, exist_ok=True)
+    needed = {
+        layers: recompute or not (out / f"norms_during_training_{layers}_layers.json").exists()
+        for layers in (2, 3, 4)
+    }
+    need_initial = recompute or not (out / "initial_gradient.json").exists()
+    if not need_initial and not any(needed.values()):
+        return False
+
+    data = make_dataset(args.train_size)
+    set_seed(args.seed)
+
+    # The first 1000 examples are enough to expose the vanishing-gradient
+    # pattern; the book used a two-hidden-layer network for this table.
+    if need_initial:
+        net = network2.Network(ARCHITECTURES[2])
+        write_json(out / "initial_gradient.json", initial_gradient(net, data))
+        print("Saved the averaged initial gradient for the top six neurons per layer.")
+        if needed[2]:
+            write_json(
+                out / "norms_during_training_2_layers.json",
+                train_and_record(net, data, args),
+            )
+            needed[2] = False
+
+    for layers in (2, 3, 4):
+        if not needed[layers]:
+            continue
+        net = network2.Network(ARCHITECTURES[layers])
+        write_json(
+            out / f"norms_during_training_{layers}_layers.json",
+            train_and_record(net, data, args),
+        )
+    return True
+
+
+def write_json(path: Path, payload) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+
+def plot_training(filename: Path, num_layers: int) -> None:
+    with filename.open("r", encoding="utf-8") as handle:
+        norms = json.load(handle)
+    if not norms:
+        print(f"Skipping {filename.name}: no data")
+        return
+
+    epochs = len(norms)
+    fig, ax = plt.subplots()
+    for layer in range(min(num_layers, len(norms[0]))):
+        ax.plot(
+            np.arange(epochs),
+            [row[layer] for row in norms],
+            color=COLORS[layer],
+            label=f"Hidden layer {layer + 1}",
+        )
     ax.set_xlim([0, epochs])
     ax.grid(True)
-    ax.set_xlabel('Number of epochs of training')
-    ax.set_title('Speed of learning: %s hidden layers' % num_layers)
-    ax.set_yscale('log')
-    plt.legend(loc="upper right")
-    fig_filename = "training_speed_%s_layers.png" % num_layers
-    plt.savefig(fig_filename)
-    shutil.copy(fig_filename, "../../images/"+fig_filename)
-    plt.show()
+    ax.set_xlabel("Number of epochs of training")
+    ax.set_title(f"Speed of learning: {num_layers} hidden layers")
+    ax.set_yscale("log")
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(filename.with_name(f"training_speed_{num_layers}_layers.png"), dpi=150)
+    plt.close(fig)
 
-def get_average_gradient(net, training_data):
-    nabla_b_results = [net.backprop(x, y)[0] for x, y in training_data]
-    gradient = list_sum(nabla_b_results)
-    return [(np.reshape(g, len(g))/len(training_data)).tolist() 
-            for g in gradient]
 
-def zip_sum(a, b): 
-    return [x+y for (x, y) in zip(a, b)]
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    out = args.output_dir
 
-def list_sum(l):
-    return reduce(zip_sum, l)
+    artifacts = [out / "initial_gradient.json"] + [
+        out / f"norms_during_training_{layers}_layers.json" for layers in (2, 3, 4)
+    ]
+    if args.recompute or any(not path.exists() for path in artifacts):
+        computed = compute_all(args, args.recompute)
+    else:
+        computed = False
+    if not computed:
+        print("Reusing precomputed JSON (pass --recompute to retrain).")
 
-def list_norm(l):
-    return math.sqrt(sum([x*x for x in l]))
+    for layers in (2, 3, 4):
+        filename = out / f"norms_during_training_{layers}_layers.json"
+        if filename.exists():
+            plot_training(filename, layers)
+        else:
+            print(f"Skipping {filename.name}: file not found")
+
 
 if __name__ == "__main__":
     main()

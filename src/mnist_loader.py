@@ -1,85 +1,70 @@
-"""
-mnist_loader
-~~~~~~~~~~~~
+"""MNIST loading utilities (modernized, backwards-compatible API).
 
-A library to load the MNIST image data.  For details of the data
-structures that are returned, see the doc strings for ``load_data``
-and ``load_data_wrapper``.  In practice, ``load_data_wrapper`` is the
-function usually called by our neural network code.
+The original public functions ``load_data``, ``load_data_wrapper`` and
+``vectorized_result`` are preserved so older book snippets keep working.
+New code should prefer :mod:`nndl.data`.
 """
 
-#### Libraries
-# Standard library
-import cPickle
-import gzip
+from __future__ import annotations
 
-# Third-party libraries
+from pathlib import Path
+
 import numpy as np
 
-def load_data():
-    """Return the MNIST data as a tuple containing the training data,
-    the validation data, and the test data.
+from nndl.data import DEFAULT_MNIST_PATH, MNISTBundle, load_mnist, load_raw
 
-    The ``training_data`` is returned as a tuple with two entries.
-    The first entry contains the actual training images.  This is a
-    numpy ndarray with 50,000 entries.  Each entry is, in turn, a
-    numpy ndarray with 784 values, representing the 28 * 28 = 784
-    pixels in a single MNIST image.
+__all__ = [
+    "DEFAULT_MNIST_PATH",
+    "MNISTBundle",
+    "load_data",
+    "load_data_wrapper",
+    "vectorized_result",
+]
 
-    The second entry in the ``training_data`` tuple is a numpy ndarray
-    containing 50,000 entries.  Those entries are just the digit
-    values (0...9) for the corresponding images contained in the first
-    entry of the tuple.
 
-    The ``validation_data`` and ``test_data`` are similar, except
-    each contains only 10,000 images.
+def load_data(path: str | Path | None = None):
+    """Return ``(training_data, validation_data, test_data)``.
 
-    This is a nice data format, but for use in neural networks it's
-    helpful to modify the format of the ``training_data`` a little.
-    That's done in the wrapper function ``load_data_wrapper()``, see
-    below.
+    Each split is a ``(images, labels)`` tuple of NumPy arrays.  The pickle is
+    read with ``encoding='latin1'`` so the original Python 2 file works on
+    modern Python without private pickle APIs.
     """
-    f = gzip.open('../data/mnist.pkl.gz', 'rb')
-    training_data, validation_data, test_data = cPickle.load(f)
-    f.close()
-    return (training_data, validation_data, test_data)
 
-def load_data_wrapper():
-    """Return a tuple containing ``(training_data, validation_data,
-    test_data)``. Based on ``load_data``, but the format is more
-    convenient for use in our implementation of neural networks.
+    return load_raw(path)
 
-    In particular, ``training_data`` is a list containing 50,000
-    2-tuples ``(x, y)``.  ``x`` is a 784-dimensional numpy.ndarray
-    containing the input image.  ``y`` is a 10-dimensional
-    numpy.ndarray representing the unit vector corresponding to the
-    correct digit for ``x``.
 
-    ``validation_data`` and ``test_data`` are lists containing 10,000
-    2-tuples ``(x, y)``.  In each case, ``x`` is a 784-dimensional
-    numpy.ndarry containing the input image, and ``y`` is the
-    corresponding classification, i.e., the digit values (integers)
-    corresponding to ``x``.
+def load_data_wrapper(path: str | Path | None = None):
+    """Return the book's list-of-pairs format.
 
-    Obviously, this means we're using slightly different formats for
-    the training data and the validation / test data.  These formats
-    turn out to be the most convenient for use in our neural network
-    code."""
-    tr_d, va_d, te_d = load_data()
+    Training pairs are ``(784x1 image, 10x1 one-hot label)``.  Validation and
+    test pairs are ``(784x1 image, integer label)``.
+    """
+
+    tr_d, va_d, te_d = load_data(path)
     training_inputs = [np.reshape(x, (784, 1)) for x in tr_d[0]]
     training_results = [vectorized_result(y) for y in tr_d[1]]
-    training_data = zip(training_inputs, training_results)
+    training_data = list(zip(training_inputs, training_results))
     validation_inputs = [np.reshape(x, (784, 1)) for x in va_d[0]]
-    validation_data = zip(validation_inputs, va_d[1])
+    validation_data = list(zip(validation_inputs, va_d[1]))
     test_inputs = [np.reshape(x, (784, 1)) for x in te_d[0]]
-    test_data = zip(test_inputs, te_d[1])
-    return (training_data, validation_data, test_data)
+    test_data = list(zip(test_inputs, te_d[1]))
+    return training_data, validation_data, test_data
 
-def vectorized_result(j):
-    """Return a 10-dimensional unit vector with a 1.0 in the jth
-    position and zeroes elsewhere.  This is used to convert a digit
-    (0...9) into a corresponding desired output from the neural
-    network."""
-    e = np.zeros((10, 1))
-    e[j] = 1.0
+
+def load_data_tensors(
+    path: str | Path | None = None,
+    *,
+    flatten: bool = False,
+    normalize: bool = False,
+) -> MNISTBundle:
+    """Fast path returning PyTorch tensors directly."""
+
+    return load_mnist(path, flatten=flatten, normalize=normalize)
+
+
+def vectorized_result(j: int) -> np.ndarray:
+    """Return a 10-dimensional one-hot column vector."""
+
+    e = np.zeros((10, 1), dtype=np.float32)
+    e[int(j)] = 1.0
     return e
