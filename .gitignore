@@ -18,8 +18,9 @@ htmlcov/
 
 # Training artifacts
 /runs/
-/data/*.npz
-/data/emnist/
+# Keep the original MNIST pickle tracked; everything else in data/ is local.
+/data/*
+!/data/mnist.pkl.gz
 *.pt
 *.pth
 *.onnx
